@@ -57,6 +57,14 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define TP_ISR_Pin GPIO_PIN_10
+#define TP_ISR_GPIO_Port GPIOB
+#define TP_TASK_A_Pin GPIO_PIN_10
+#define TP_TASK_A_GPIO_Port GPIOA
+#define TP_TASK_C_Pin GPIO_PIN_4
+#define TP_TASK_C_GPIO_Port GPIOB
+#define TP_TASK_B_Pin GPIO_PIN_5
+#define TP_TASK_B_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
