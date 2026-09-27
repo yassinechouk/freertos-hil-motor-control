@@ -10,6 +10,7 @@ every link is **computed analytically first, then verified by measurement**
 on the hardware.
 
 **Status:** Phase 1 complete (STM32 real-time core, first timing measurements).
+Phase 2 in progress: setpoint acquisition and motor PWM done, encoder input next.
 Phase 0 is waiting for a board modification to switch the clock from HSI to HSE.
 
 ## Architecture
@@ -82,6 +83,25 @@ reads DWT when it wakes.
 | `-O0` | 13 841 | 987 cycles (12.3 µs) | 987 | 987 |
 | `-O2` | 11 488 | **503 cycles (6.3 µs)** | 519 | 556 cycles (7.0 µs) |
 
+### Controller I/O
+
+Setpoint chain: TIM3 (10 kHz) triggers ADC1 in hardware, circular DMA fills 2 × 10
+samples, and each half-transfer interrupt notifies the acquisition task, which averages
+the block (1 kHz setpoint). The task itself starts the hardware, so no interrupt can
+ever notify a task that does not exist yet. Motor PWM: TIM1 CH2, 20 kHz, 4000 steps,
+compare preload enabled; currently driven open-loop from the setpoint.
+
+| Metric | Predicted | Measured |
+|---|---|---|
+| Setpoint acquisition rate | 1000 blocks/s, 0 late, 0 overrun | 1000 blocks/s, 0 late, 0 overrun |
+| ISR-to-task latency (DMA ISR → `xTaskNotifyFromISR` → task), steady state | — | min 776 / avg 815 / max **847 cycles** (9.7 / 10.2 / 10.6 µs) |
+| Same, first wake-ups after reset (cold instruction cache) | — | up to 1432 cycles (17.9 µs) |
+| PWM frequency (TIM1 CH2, PA9) | 20 kHz (20.014 kHz with HSI +0.07 %) | 20.017 kHz on one period, ±0.08 % (analyser: 1199 samples/period) |
+| PWM duty follows setpoint (open loop) | proportional | 31.7 / 67.6 / 74.2 % at three positions, ±1 sample (0.08 %) |
+| PWM period while duty changes (preload enabled) | constant | constant, no glitch observed |
+
+![PWM at 68 % duty, PulseView PWM decoder](captures/pwm-duty-68.png)
+
 ### Memory
 
 | Metric | Measured |
@@ -97,14 +117,28 @@ reads DWT when it wakes.
    and added to the analysis.
 2. **A measured maximum is not a bound.** At `-O0`, every one of 13 841 latency samples was
    identical because the tick, the HAL time base and all task releases are phase-locked: no
-   interrupt ever fell inside the measurement window. Only analysis gives a worst case.
+   interrupt ever fell inside the measurement window. TIM3 is derived from the same clock, so the
+   DMA interrupt is phase-locked too. Only analysis gives a worst case.
 3. **The binary matters.** The same kernel on the same hardware wakes a task twice as fast
-   at `-O2` as at `-O0`. All published numbers now come from the `-O2` build.
-4. **Clock error propagates.** The +0.07 % HSI error measured on MCO reappears in task timing:
+   at `-O2` as at `-O0`, and even an unrelated code change moved the ISR-to-task minimum from
+   795 to 776 cycles by shifting code in flash. Numbers are valid for one binary only.
+4. **Start-up is not steady state.** The first wake-ups after reset cost up to 1432 cycles
+   (cold instruction cache) against 847 in steady state. Statistics skip a 10-sample warm-up.
+5. **A debugger stops the core, not the peripherals.** Halting the core let the DMA overwrite
+   both buffer halves (4 late blocks). TIM3 and TIM1 are now frozen on debug halt; for TIM1 this
+   also disables the PWM outputs, so a halted controller never keeps driving the motor.
+6. **Clock error propagates.** The +0.07 % HSI error measured on MCO reappears in task timing:
    a 5 ms busy-wait counted in cycles lasts 4.9965 ms.
-5. **Open question:** at `-O2` the latency varies by 53 cycles (503–556). Two hypotheses,
-   a tick interrupt occasionally inside the window or instruction-cache state, to be
-   decided with a latency histogram.
+7. **Know the instrument's resolution.** At 24 MS/s the analyser resolves the PWM duty to
+   1/1199 (0.08 %), coarser than the PWM itself (1/4000). A 0.08 % step between periods is the
+   instrument, not the signal.
+
+**Open questions**
+
+- Task-to-task latency varies by 53 cycles at `-O2` (503–556): tick interrupt inside the window
+  or instruction-cache state, to be decided with a latency histogram.
+- The ADC overrun counter has never been seen to increment: the error path must be exercised
+  by forcing an overrun (phase 5).
 
 ## Hardware
 
@@ -112,18 +146,22 @@ reads DWT when it wakes.
   HSE receives the 8 MHz MCO from the ST-LINK. On this board the MCO is not connected to OSC_IN
   by default, whatever the revision (UM1724 §6.7.1). Until then the PLL runs from HSI.
 - 2 × ESP32
-- Potentiometer (speed setpoint), push buttons, LEDs, I2C RTC module (fault timestamps)
+- Potentiometer (speed setpoint): ends on 3V3 and GND, wiper on A0. Never on 5 V.
+- Push buttons, LEDs, I2C RTC module (fault timestamps)
 - Logic analyser (8 ch, 24 MS/s)
 
 ### Pin map (STM32)
 
 | Pin | Arduino | Function |
 |---|---|---|
+| PA0 | A0 | Setpoint potentiometer (ADC1 IN5) |
+| PA9 | D8 | Motor PWM (TIM1 CH2, 20 kHz) |
+| PA6 | D12 | Reserved: TIM1 break input (hardware emergency stop, phase 5) |
 | PA8 | D7 | MCO (SYSCLK/16) |
 | PA10 | D2 | `TP_TASK_A` timing pin |
 | PB5 | D4 | `TP_TASK_B` timing pin |
-| PB4 | D5 | `TP_TASK_C` timing pin |
-| PB10 | D6 | `TP_ISR` timing pin |
+| PB4 | D5 | `TP_TASK_C` timing pin (acquisition task) |
+| PB10 | D6 | `TP_ISR` timing pin (DMA interrupt) |
 | PA5 | D13 | `LED_FAULT` (LD2) |
 | PA13 / PA14 / PB3 | — | SWD + SWO (reserved) |
 
@@ -156,10 +194,13 @@ reads DWT when it wakes.
 - [ ] Latency histogram to explain the `-O2` variation
 
 ### Phase 2 — Controller I/O
-- [ ] PWM output to the motor (timer)
+- [x] Setpoint acquisition: timer-triggered ADC, circular DMA, double buffer
+- [x] ISR → task hand-off with task notifications, latency measured
+- [x] PWM output to the motor (TIM1, 20 kHz, preload), open loop from setpoint
+- [x] TIM1 / TIM3 frozen on debug halt
 - [ ] Quadrature encoder input (timer in encoder mode)
-- [ ] Setpoint acquisition: timer-triggered ADC with DMA
-- [ ] ISR → task hand-off with task notifications
+- [ ] Health task extended to the new tasks' stacks
+- [ ] Phase-1 experiment tasks (A, B, ctxRx, ctxTx) behind a build switch
 
 ### Phase 3 — Plant simulator (ESP32 #1)
 - [ ] DC motor model, fixed-step integration, parameters from a real motor datasheet
