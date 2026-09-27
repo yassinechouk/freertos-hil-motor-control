@@ -22,7 +22,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "FreeRTOS.h"
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -55,6 +56,20 @@ const osThreadAttr_t healthTask_attributes = {
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
+#define TASK_A_PERIOD_MS    10U
+#define TASK_A_WORK_US      2000U
+#define TASK_A_PRIORITY     20U
+
+#define TASK_B_PERIOD_MS    25U
+#define TASK_B_WORK_US      5000U
+#define TASK_B_PRIORITY     16U
+
+#define TASK_STACK_WORDS    256U
+
+static StaticTask_t taskA_TCB;
+static StackType_t  taskA_Stack[TASK_STACK_WORDS];
+static StaticTask_t taskB_TCB;
+static StackType_t  taskB_Stack[TASK_STACK_WORDS];
 
 /* USER CODE END PV */
 
@@ -69,7 +84,49 @@ void StartHealthTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void dwt_init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;  /* active le bloc de trace */
+  DWT->CYCCNT = 0U;
+  DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;            /* démarre le compteur de cycles */
+}
 
+static void busy_work_us(uint32_t us)
+{
+  const uint32_t start  = DWT->CYCCNT;
+  const uint32_t cycles = us * (SystemCoreClock / 1000000U);
+  while ((DWT->CYCCNT - start) < cycles) { }
+}
+
+static void TaskA(void *arg)
+{
+  (void)arg;
+  const TickType_t period = pdMS_TO_TICKS(TASK_A_PERIOD_MS);
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;)
+  {
+    vTaskDelayUntil(&lastWake, period);
+    HAL_GPIO_WritePin(TP_TASK_A_GPIO_Port, TP_TASK_A_Pin, GPIO_PIN_SET);
+    busy_work_us(TASK_A_WORK_US);
+    HAL_GPIO_WritePin(TP_TASK_A_GPIO_Port, TP_TASK_A_Pin, GPIO_PIN_RESET);
+  }
+}
+
+static void TaskB(void *arg)
+{
+  (void)arg;
+  const TickType_t period = pdMS_TO_TICKS(TASK_B_PERIOD_MS);
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;)
+  {
+    vTaskDelayUntil(&lastWake, period);
+    HAL_GPIO_WritePin(TP_TASK_B_GPIO_Port, TP_TASK_B_Pin, GPIO_PIN_SET);
+    busy_work_us(TASK_B_WORK_US);
+    HAL_GPIO_WritePin(TP_TASK_B_GPIO_Port, TP_TASK_B_Pin, GPIO_PIN_RESET);
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -102,7 +159,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
-
+  dwt_init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -130,6 +187,12 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  TaskHandle_t hA = xTaskCreateStatic(TaskA, "taskA", TASK_STACK_WORDS, NULL,
+                                      TASK_A_PRIORITY, taskA_Stack, &taskA_TCB);
+  TaskHandle_t hB = xTaskCreateStatic(TaskB, "taskB", TASK_STACK_WORDS, NULL,
+                                      TASK_B_PRIORITY, taskB_Stack, &taskB_TCB);
+  configASSERT(hA != NULL);
+  configASSERT(hB != NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
