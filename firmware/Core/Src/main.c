@@ -47,6 +47,15 @@ typedef struct
   uint32_t count;               /* number of samples                           */
   uint64_t sum;
 } CycleStats_t;
+
+typedef struct
+{
+  uint32_t blocks;              /* half-buffers processed                      */
+  uint32_t lastRaw;             /* average of the last block, 0..4095          */
+  uint32_t lastMv;              /* same, in millivolts (nominal 3300 mV ref)   */
+  uint32_t lateBlocks;          /* both halves ready at once: task too late    */
+  uint32_t overruns;            /* ADC overrun events                          */
+} AcqStatus_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -68,6 +77,14 @@ typedef struct
 #define CTX_RX_PRIORITY       24U   /* highest: wakes immediately           */
 #define CTX_TX_PRIORITY       12U   /* below A and B                        */
 #define CTX_TX_PERIOD_MS      5U
+
+/* Setpoint acquisition: TIM3 (10 kHz) -> ADC1 -> circular DMA, 2 x 10 samples.
+   Each half is ready every 1 ms and processed by the acquisition task. */
+#define ADC_BUF_LEN           20U
+#define ADC_HALF_LEN          (ADC_BUF_LEN / 2U)
+#define ACQ_PRIORITY          22U   /* above A and B, below ctxRx           */
+#define ACQ_BIT_HALF          (1UL << 0)
+#define ACQ_BIT_FULL          (1UL << 1)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -76,6 +93,11 @@ typedef struct
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
+TIM_HandleTypeDef htim3;
+
 /* Definitions for healthTask */
 osThreadId_t healthTaskHandle;
 uint32_t healthTaskBuffer[ 256 ];
@@ -105,15 +127,27 @@ static StackType_t  ctxTx_Stack[TASK_STACK_WORDS];
 static TaskHandle_t hCtxRx = NULL;
 static TaskHandle_t hCtxTx = NULL;
 
+static uint16_t     adcBuf[ADC_BUF_LEN];     /* written by DMA only          */
+static StaticTask_t acq_TCB;
+static StackType_t  acq_Stack[TASK_STACK_WORDS];
+static TaskHandle_t hAcq = NULL;
+
 /* Globals (not static) so they are easy to watch in Live Expressions */
 volatile HealthStatus_t g_health;
 volatile CycleStats_t   g_ctxSwitch = { .min = UINT32_MAX };
 volatile uint32_t       g_ctxT0;      /* timestamp written by the sender  */
+
+volatile AcqStatus_t    g_acq;
+volatile CycleStats_t   g_isrToTask = { .min = UINT32_MAX };
+volatile uint32_t       g_isrT0;      /* timestamp written by the DMA ISR */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM3_Init(void);
 void StartHealthTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -204,6 +238,65 @@ static void CtxTxTask(void *arg)
     xTaskNotifyGive(hCtxRx);
   }
 }
+
+/* Acquisition task: woken by the DMA half/full-transfer interrupt.
+   It starts the hardware itself, so that no interrupt can ever try to
+   notify a task that does not exist yet. */
+static void AcqTask(void *arg)
+{
+  (void)arg;
+
+  __HAL_DBGMCU_FREEZE_TIM3();   /* TIM3 stops while the core is halted by the debugger */
+
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adcBuf, ADC_BUF_LEN) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_Base_Start(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  uint32_t warmup = 10U;        /* ignore the first wake-ups (cold cache) */
+
+  for (;;)
+  {
+    uint32_t bits = 0U;
+    (void)xTaskNotifyWait(0U, ACQ_BIT_HALF | ACQ_BIT_FULL, &bits, portMAX_DELAY);
+
+    const uint32_t dt = DWT->CYCCNT - g_isrT0;
+    if (warmup > 0U)
+    {
+      warmup--;
+    }
+    else
+    {
+      stats_add(&g_isrToTask, dt);
+    }
+
+    HAL_GPIO_WritePin(TP_TASK_C_GPIO_Port, TP_TASK_C_Pin, GPIO_PIN_SET);
+
+    if (((bits & ACQ_BIT_HALF) != 0U) && ((bits & ACQ_BIT_FULL) != 0U))
+    {
+      g_acq.lateBlocks++;
+    }
+
+    const uint16_t *block = ((bits & ACQ_BIT_FULL) != 0U) ? &adcBuf[ADC_HALF_LEN]
+                                                          : &adcBuf[0];
+    uint32_t sum = 0U;
+    for (uint32_t i = 0U; i < ADC_HALF_LEN; i++)
+    {
+      sum += block[i];
+    }
+    const uint32_t avg = sum / ADC_HALF_LEN;
+
+    g_acq.lastRaw = avg;
+    g_acq.lastMv  = (avg * 3300U) / 4095U;
+    g_acq.blocks++;
+
+    HAL_GPIO_WritePin(TP_TASK_C_GPIO_Port, TP_TASK_C_Pin, GPIO_PIN_RESET);
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -235,8 +328,17 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   dwt_init();
+
+  /* Calibrate the ADC once, while it is still disabled. */
+  if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -278,6 +380,10 @@ int main(void)
                              CTX_TX_PRIORITY, ctxTx_Stack, &ctxTx_TCB);
   configASSERT(hCtxRx != NULL);
   configASSERT(hCtxTx != NULL);
+
+  hAcq = xTaskCreateStatic(AcqTask, "acq", TASK_STACK_WORDS, NULL,
+                           ACQ_PRIORITY, acq_Stack, &acq_TCB);
+  configASSERT(hAcq != NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -351,6 +457,134 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T3_TRGO;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 79;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 99;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -407,7 +641,46 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* Called from the DMA interrupt (priority 6, allowed to use FromISR APIs).
+   Kept minimal: timestamp, notify, request a context switch if needed. */
+static void acq_notify_from_isr(uint32_t bit)
+{
+  HAL_GPIO_WritePin(TP_ISR_GPIO_Port, TP_ISR_Pin, GPIO_PIN_SET);
+  g_isrT0 = DWT->CYCCNT;
 
+  BaseType_t woken = pdFALSE;
+  if (hAcq != NULL)
+  {
+    (void)xTaskNotifyFromISR(hAcq, bit, eSetBits, &woken);
+  }
+
+  HAL_GPIO_WritePin(TP_ISR_GPIO_Port, TP_ISR_Pin, GPIO_PIN_RESET);
+  portYIELD_FROM_ISR(woken);
+}
+
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc->Instance == ADC1)
+  {
+    acq_notify_from_isr(ACQ_BIT_HALF);
+  }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc->Instance == ADC1)
+  {
+    acq_notify_from_isr(ACQ_BIT_FULL);
+  }
+}
+
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+  if ((hadc->Instance == ADC1) && ((hadc->ErrorCode & HAL_ADC_ERROR_OVR) != 0U))
+  {
+    g_acq.overruns++;
+  }
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartHealthTask */
