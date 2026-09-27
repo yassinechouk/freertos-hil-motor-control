@@ -29,12 +29,29 @@
 /* Private typedef -----------------------------------------------------------*/
 typedef StaticTask_t osStaticThreadDef_t;
 /* USER CODE BEGIN PTD */
-
+typedef struct
+{
+  size_t      heapFree;         /* xPortGetFreeHeapSize()                      */
+  UBaseType_t stackFreeA;       /* minimum free stack ever seen, in words      */
+  UBaseType_t stackFreeB;
+  UBaseType_t stackFreeHealth;
+  uint32_t    checks;           /* incremented once per health check           */
+} HealthStatus_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define TASK_A_PERIOD_MS      10U
+#define TASK_A_WORK_US        2000U
+#define TASK_A_PRIORITY       20U
 
+#define TASK_B_PERIOD_MS      25U
+#define TASK_B_WORK_US        5000U
+#define TASK_B_PRIORITY       16U
+
+#define TASK_STACK_WORDS      256U
+
+#define HEALTH_PERIOD_MS      1000U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,21 +73,16 @@ const osThreadAttr_t healthTask_attributes = {
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
-#define TASK_A_PERIOD_MS    10U
-#define TASK_A_WORK_US      2000U
-#define TASK_A_PRIORITY     20U
-
-#define TASK_B_PERIOD_MS    25U
-#define TASK_B_WORK_US      5000U
-#define TASK_B_PRIORITY     16U
-
-#define TASK_STACK_WORDS    256U
-
 static StaticTask_t taskA_TCB;
 static StackType_t  taskA_Stack[TASK_STACK_WORDS];
 static StaticTask_t taskB_TCB;
 static StackType_t  taskB_Stack[TASK_STACK_WORDS];
 
+static TaskHandle_t hTaskA = NULL;
+static TaskHandle_t hTaskB = NULL;
+
+/* Global (not static) so it is easy to watch in Live Expressions */
+volatile HealthStatus_t g_health;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,16 +98,16 @@ void StartHealthTask(void *argument);
 /* USER CODE BEGIN 0 */
 static void dwt_init(void)
 {
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;  /* active le bloc de trace */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;  /* enable the trace block    */
   DWT->CYCCNT = 0U;
-  DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;            /* démarre le compteur de cycles */
+  DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;            /* start the cycle counter  */
 }
 
 static void busy_work_us(uint32_t us)
 {
   const uint32_t start  = DWT->CYCCNT;
   const uint32_t cycles = us * (SystemCoreClock / 1000000U);
-  while ((DWT->CYCCNT - start) < cycles) { }
+  while ((DWT->CYCCNT - start) < cycles) { }       /* wrap-safe (unsigned)     */
 }
 
 static void TaskA(void *arg)
@@ -186,13 +198,14 @@ int main(void)
   healthTaskHandle = osThreadNew(StartHealthTask, NULL, &healthTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  TaskHandle_t hA = xTaskCreateStatic(TaskA, "taskA", TASK_STACK_WORDS, NULL,
-                                      TASK_A_PRIORITY, taskA_Stack, &taskA_TCB);
-  TaskHandle_t hB = xTaskCreateStatic(TaskB, "taskB", TASK_STACK_WORDS, NULL,
-                                      TASK_B_PRIORITY, taskB_Stack, &taskB_TCB);
-  configASSERT(hA != NULL);
-  configASSERT(hB != NULL);
+  configASSERT(healthTaskHandle != NULL);
+
+  hTaskA = xTaskCreateStatic(TaskA, "taskA", TASK_STACK_WORDS, NULL,
+                             TASK_A_PRIORITY, taskA_Stack, &taskA_TCB);
+  hTaskB = xTaskCreateStatic(TaskB, "taskB", TASK_STACK_WORDS, NULL,
+                             TASK_B_PRIORITY, taskB_Stack, &taskB_TCB);
+  configASSERT(hTaskA != NULL);
+  configASSERT(hTaskB != NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -278,14 +291,21 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, LED_FAULT_Pin|TP_TASK_A_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, TP_ISR_Pin|TP_TASK_C_Pin|TP_TASK_B_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(TP_TASK_A_GPIO_Port, TP_TASK_A_Pin, GPIO_PIN_RESET);
+  /*Configure GPIO pin : LED_FAULT_Pin */
+  GPIO_InitStruct.Pin = LED_FAULT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_FAULT_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : TP_ISR_Pin TP_TASK_C_Pin TP_TASK_B_Pin */
   GPIO_InitStruct.Pin = TP_ISR_Pin|TP_TASK_C_Pin|TP_TASK_B_Pin;
@@ -320,7 +340,8 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN Header_StartHealthTask */
 /**
-  * @brief  Function implementing the healthTask thread.
+  * @brief  Health monitor: once per HEALTH_PERIOD_MS, records heap usage and
+  *         the minimum free stack ever seen by each task.
   * @param  argument: Not used
   * @retval None
   */
@@ -328,10 +349,18 @@ static void MX_GPIO_Init(void)
 void StartHealthTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
+  (void)argument;
+  const TickType_t period = pdMS_TO_TICKS(HEALTH_PERIOD_MS);
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;)
   {
-    osDelay(1);
+    vTaskDelayUntil(&lastWake, period);
+    g_health.heapFree        = xPortGetFreeHeapSize();
+    g_health.stackFreeA      = uxTaskGetStackHighWaterMark(hTaskA);
+    g_health.stackFreeB      = uxTaskGetStackHighWaterMark(hTaskB);
+    g_health.stackFreeHealth = uxTaskGetStackHighWaterMark(NULL);
+    g_health.checks++;
   }
   /* USER CODE END 5 */
 }
@@ -365,11 +394,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* Fail-stop: freeze everything and light LD2 so the fault is visible
+     even without a debugger attached. */
   __disable_irq();
-  while (1)
-  {
-  }
+  HAL_GPIO_WritePin(LED_FAULT_GPIO_Port, LED_FAULT_Pin, GPIO_PIN_SET);
+  while (1) { }
   /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
