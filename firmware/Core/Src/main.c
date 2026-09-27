@@ -96,6 +96,7 @@ typedef struct
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
 
 /* Definitions for healthTask */
@@ -148,6 +149,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_TIM1_Init(void);
 void StartHealthTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -246,7 +248,18 @@ static void AcqTask(void *arg)
 {
   (void)arg;
 
-  __HAL_DBGMCU_FREEZE_TIM3();   /* TIM3 stops while the core is halted by the debugger */
+  /* Debug halt: stop TIM3 (no acquisition while the core is frozen) and
+     TIM1 (motor PWM must not keep driving while nobody is in control). */
+  __HAL_DBGMCU_FREEZE_TIM3();
+  __HAL_DBGMCU_FREEZE_TIM1();
+
+  /* Motor PWM: start at 0 % duty. HAL_TIM_PWM_Start also sets MOE,
+     the main output enable of the advanced timer. */
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0U);
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adcBuf, ADC_BUF_LEN) != HAL_OK)
   {
@@ -278,9 +291,10 @@ static void AcqTask(void *arg)
 
     if (((bits & ACQ_BIT_HALF) != 0U) && ((bits & ACQ_BIT_FULL) != 0U))
     {
-      g_acq.lateBlocks++;
+      g_acq.lateBlocks++;   /* one block was overwritten before being read */
     }
 
+    /* Process the half the DMA has just completed; it is filling the other. */
     const uint16_t *block = ((bits & ACQ_BIT_FULL) != 0U) ? &adcBuf[ADC_HALF_LEN]
                                                           : &adcBuf[0];
     uint32_t sum = 0U;
@@ -293,6 +307,11 @@ static void AcqTask(void *arg)
     g_acq.lastRaw = avg;
     g_acq.lastMv  = (avg * 3300U) / 4095U;
     g_acq.blocks++;
+
+    /* Temporary open loop (phase 2 test): setpoint 0..4095 -> duty 0..3999.
+       Replaced by the PI controller output in phase 4. */
+    const uint32_t duty = (avg * (__HAL_TIM_GET_AUTORELOAD(&htim1) + 1U)) / 4096U;
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty);
 
     HAL_GPIO_WritePin(TP_TASK_C_GPIO_Port, TP_TASK_C_Pin, GPIO_PIN_RESET);
   }
@@ -331,6 +350,7 @@ int main(void)
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_TIM3_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
   dwt_init();
 
@@ -520,6 +540,86 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 3999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
 
 }
 
