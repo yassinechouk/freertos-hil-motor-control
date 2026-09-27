@@ -37,6 +37,16 @@ typedef struct
   UBaseType_t stackFreeHealth;
   uint32_t    checks;           /* incremented once per health check           */
 } HealthStatus_t;
+
+typedef struct
+{
+  uint32_t last;                /* last sample, in CPU cycles                  */
+  uint32_t min;                 /* best case since reset                       */
+  uint32_t max;                 /* worst case since reset                      */
+  uint32_t avg;                 /* running average                             */
+  uint32_t count;               /* number of samples                           */
+  uint64_t sum;
+} CycleStats_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -52,6 +62,12 @@ typedef struct
 #define TASK_STACK_WORDS      256U
 
 #define HEALTH_PERIOD_MS      1000U
+
+/* Context-switch measurement: a low-priority sender notifies a
+   high-priority receiver; the receiver measures the delay with DWT. */
+#define CTX_RX_PRIORITY       24U   /* highest: wakes immediately           */
+#define CTX_TX_PRIORITY       12U   /* below A and B                        */
+#define CTX_TX_PERIOD_MS      5U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -81,8 +97,18 @@ static StackType_t  taskB_Stack[TASK_STACK_WORDS];
 static TaskHandle_t hTaskA = NULL;
 static TaskHandle_t hTaskB = NULL;
 
-/* Global (not static) so it is easy to watch in Live Expressions */
+static StaticTask_t ctxRx_TCB;
+static StackType_t  ctxRx_Stack[TASK_STACK_WORDS];
+static StaticTask_t ctxTx_TCB;
+static StackType_t  ctxTx_Stack[TASK_STACK_WORDS];
+
+static TaskHandle_t hCtxRx = NULL;
+static TaskHandle_t hCtxTx = NULL;
+
+/* Globals (not static) so they are easy to watch in Live Expressions */
 volatile HealthStatus_t g_health;
+volatile CycleStats_t   g_ctxSwitch = { .min = UINT32_MAX };
+volatile uint32_t       g_ctxT0;      /* timestamp written by the sender  */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -137,6 +163,45 @@ static void TaskB(void *arg)
     HAL_GPIO_WritePin(TP_TASK_B_GPIO_Port, TP_TASK_B_Pin, GPIO_PIN_SET);
     busy_work_us(TASK_B_WORK_US);
     HAL_GPIO_WritePin(TP_TASK_B_GPIO_Port, TP_TASK_B_Pin, GPIO_PIN_RESET);
+  }
+}
+
+static void stats_add(volatile CycleStats_t *s, uint32_t sample)
+{
+  s->last = sample;
+  if (sample < s->min) { s->min = sample; }
+  if (sample > s->max) { s->max = sample; }
+  s->sum += sample;
+  s->count++;
+  s->avg = (uint32_t)(s->sum / s->count);
+}
+
+/* Receiver: highest priority, blocked until notified. */
+static void CtxRxTask(void *arg)
+{
+  (void)arg;
+  for (;;)
+  {
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    const uint32_t dt = DWT->CYCCNT - g_ctxT0;
+    stats_add(&g_ctxSwitch, dt);
+  }
+}
+
+/* Sender: low priority, timestamps then notifies the receiver.
+   The receiver preempts it immediately, so dt covers:
+   notify call + PendSV + context save/restore + return from NotifyTake. */
+static void CtxTxTask(void *arg)
+{
+  (void)arg;
+  const TickType_t period = pdMS_TO_TICKS(CTX_TX_PERIOD_MS);
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;)
+  {
+    vTaskDelayUntil(&lastWake, period);
+    g_ctxT0 = DWT->CYCCNT;
+    xTaskNotifyGive(hCtxRx);
   }
 }
 /* USER CODE END 0 */
@@ -206,6 +271,13 @@ int main(void)
                              TASK_B_PRIORITY, taskB_Stack, &taskB_TCB);
   configASSERT(hTaskA != NULL);
   configASSERT(hTaskB != NULL);
+
+  hCtxRx = xTaskCreateStatic(CtxRxTask, "ctxRx", TASK_STACK_WORDS, NULL,
+                             CTX_RX_PRIORITY, ctxRx_Stack, &ctxRx_TCB);
+  hCtxTx = xTaskCreateStatic(CtxTxTask, "ctxTx", TASK_STACK_WORDS, NULL,
+                             CTX_TX_PRIORITY, ctxTx_Stack, &ctxTx_TCB);
+  configASSERT(hCtxRx != NULL);
+  configASSERT(hCtxTx != NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
