@@ -56,6 +56,22 @@ typedef struct
   uint32_t lateBlocks;          /* both halves ready at once: task too late    */
   uint32_t overruns;            /* ADC overrun events                          */
 } AcqStatus_t;
+
+/* Encoder input (TIM2, x4 quadrature decoding). The count is compared with
+   a CPU-cycle stamp taken at the same instant, so the ratio counts/cycles
+   measures the generator frequency against the STM32 clock (HSE). */
+typedef struct
+{
+  uint32_t lastCnt;             /* TIM2->CNT at the previous window            */
+  uint32_t lastCyc;             /* DWT->CYCCNT at the previous window          */
+  uint32_t warmup;              /* windows to discard after start              */
+  int32_t  delta;               /* encoder counts in the last 1 ms window      */
+  int32_t  dmin;
+  int32_t  dmax;
+  uint32_t windows;             /* valid windows since warm-up                 */
+  int64_t  total;               /* encoder counts since warm-up                */
+  uint64_t cycles;              /* CPU cycles elapsed since warm-up            */
+} EncStats_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -97,6 +113,7 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
 /* Definitions for healthTask */
@@ -141,6 +158,8 @@ volatile uint32_t       g_ctxT0;      /* timestamp written by the sender  */
 volatile AcqStatus_t    g_acq;
 volatile CycleStats_t   g_isrToTask = { .min = UINT32_MAX };
 volatile uint32_t       g_isrT0;      /* timestamp written by the DMA ISR */
+
+volatile EncStats_t     g_enc = { .warmup = 10U, .dmin = INT32_MAX, .dmax = INT32_MIN };
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -150,6 +169,7 @@ static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_TIM2_Init(void);
 void StartHealthTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -241,6 +261,26 @@ static void CtxTxTask(void *arg)
   }
 }
 
+/* Called once per acquisition window (1 ms). Both readings are taken
+   back-to-back by the caller, so the count and the cycle stamp describe
+   the same instant. Unsigned subtraction keeps it wrap-safe. */
+static void enc_update(uint32_t cyc, uint32_t cnt)
+{
+  const int32_t  d  = (int32_t)(cnt - g_enc.lastCnt);
+  const uint32_t dc = cyc - g_enc.lastCyc;
+  g_enc.lastCnt = cnt;
+  g_enc.lastCyc = cyc;
+
+  if (g_enc.warmup > 0U) { g_enc.warmup--; return; }   /* first windows not valid */
+
+  g_enc.delta = d;
+  if (d < g_enc.dmin) { g_enc.dmin = d; }
+  if (d > g_enc.dmax) { g_enc.dmax = d; }
+  g_enc.total  += d;
+  g_enc.cycles += dc;
+  g_enc.windows++;
+}
+
 /* Acquisition task: woken by the DMA half/full-transfer interrupt.
    It starts the hardware itself, so that no interrupt can ever try to
    notify a task that does not exist yet. */
@@ -252,11 +292,17 @@ static void AcqTask(void *arg)
      TIM1 (motor PWM must not keep driving while nobody is in control). */
   __HAL_DBGMCU_FREEZE_TIM3();
   __HAL_DBGMCU_FREEZE_TIM1();
+  __HAL_DBGMCU_FREEZE_TIM2();   /* keeps encoder counts consistent with DWT, which also stops */
 
   /* Motor PWM: start at 0 % duty. HAL_TIM_PWM_Start also sets MOE,
      the main output enable of the advanced timer. */
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0U);
   if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL) != HAL_OK)
   {
     Error_Handler();
   }
@@ -286,6 +332,11 @@ static void AcqTask(void *arg)
     {
       stats_add(&g_isrToTask, dt);
     }
+
+    /* Encoder: count and cycle stamp read back-to-back (see enc_update). */
+    const uint32_t encCyc = DWT->CYCCNT;
+    const uint32_t encCnt = __HAL_TIM_GET_COUNTER(&htim2);
+    enc_update(encCyc, encCnt);
 
     HAL_GPIO_WritePin(TP_TASK_C_GPIO_Port, TP_TASK_C_Pin, GPIO_PIN_SET);
 
@@ -351,6 +402,7 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM3_Init();
   MX_TIM1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   dwt_init();
 
@@ -623,6 +675,55 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 3;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 3;
+  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
