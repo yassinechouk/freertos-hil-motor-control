@@ -101,6 +101,12 @@ typedef struct
 #define ACQ_PRIORITY          22U   /* above A and B, below ctxRx           */
 #define ACQ_BIT_HALF          (1UL << 0)
 #define ACQ_BIT_FULL          (1UL << 1)
+
+/* Fail-stop self-test, run from the acquisition task 5 s after start.
+   0 = off (reference build), 1 = call the CSS callback, 2 = call Error_Handler,
+   3 = software NMI (goes through NMI_Handler).
+   Must be 0 in the reference build. */
+#define CSS_SELFTEST          0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -173,7 +179,7 @@ static void MX_TIM2_Init(void);
 void StartHealthTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-
+void Safe_State(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -337,6 +343,19 @@ static void AcqTask(void *arg)
     const uint32_t encCyc = DWT->CYCCNT;
     const uint32_t encCnt = __HAL_TIM_GET_COUNTER(&htim2);
     enc_update(encCyc, encCnt);
+
+#if CSS_SELFTEST
+    if (g_acq.blocks == 5000U)                               /* 5 s after start */
+    {
+#if CSS_SELFTEST == 1
+      HAL_RCC_CSSCallback();
+#elif CSS_SELFTEST == 2
+      Error_Handler();
+#else
+      SCB->ICSR = SCB_ICSR_NMIPENDSET_Msk;   /* software NMI: runs NMI_Handler */
+#endif
+    }
+#endif
 
     HAL_GPIO_WritePin(TP_TASK_C_GPIO_Port, TP_TASK_C_Pin, GPIO_PIN_SET);
 
@@ -886,6 +905,28 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
     g_acq.overruns++;
   }
 }
+
+/* Safe state: motor PWM output forced low and LD2 lit. Register level, no HAL or RTOS
+   call, so it is safe from any context (task, ISR, NMI, fault handler). Disabling
+   interrupts does not stop TIM1, a hardware peripheral that would keep driving the
+   motor at the last duty cycle: the output itself has to be forced. */
+void Safe_State(void)
+{
+  TIM1->BDTR &= ~TIM_BDTR_MOE;                                                /* timer outputs off          */
+  GPIOA->BSRR = (uint32_t)GPIO_PIN_9 << 16U;                                  /* PA9 low first              */
+  GPIOA->MODER = (GPIOA->MODER & ~(3UL << (9U * 2U))) | (1UL << (9U * 2U));   /* then PA9 = plain output    */
+  LED_FAULT_GPIO_Port->BSRR = LED_FAULT_Pin;                                  /* LD2 on                     */
+}
+
+/* Clock Security System: HAL_RCC_NMI_IRQHandler() calls this from the NMI when the
+   HSE stops. The hardware has already switched SYSCLK to MSI (4 MHz), so everything
+   timed by the 80 MHz clock is wrong: fail-stop. */
+void HAL_RCC_CSSCallback(void)
+{
+  Safe_State();
+  __disable_irq();
+  while (1) { }
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartHealthTask */
@@ -944,10 +985,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* Fail-stop: freeze everything and light LD2 so the fault is visible
-     even without a debugger attached. */
+  /* Fail-stop: freeze everything, force the motor output low and light LD2 so the
+     fault is visible even without a debugger attached. */
   __disable_irq();
-  HAL_GPIO_WritePin(LED_FAULT_GPIO_Port, LED_FAULT_Pin, GPIO_PIN_SET);
+  Safe_State();
   while (1) { }
   /* USER CODE END Error_Handler_Debug */
 }
