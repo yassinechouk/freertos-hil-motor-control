@@ -20,3 +20,4 @@ RemoteSystemsTempFiles/
 Thumbs.db
 desktop.ini
 .DS_Store
+esp32-motor-sim/.vscode/
